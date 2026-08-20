@@ -72,3 +72,10 @@
 - Created GitHub Actions keep-alive cron (.github/workflows/keep-alive.yml) — pings Supabase every 3 days to prevent free-tier idle pause
 - Added Deployment section to README.md: Vercel deploy button, manual steps, Supabase auth config, keep-alive setup
 - Files touched: .gitignore, .github/workflows/keep-alive.yml, README.md
+
+## 2026-08-21 — Hotfix: Map Not Rendering
+**Root cause — two issues:**
+1. **SSR crash:** MapLibre GL JS accesses `window`/`document` on import. Top-level `import { Map } from "maplibre-gl"` runs during Next.js SSR where `window` is undefined, causing a silent failure. Fixed by switching all value imports to `await import("maplibre-gl")` (dynamic import) inside a `useEffect`, keeping only `import type` for TypeScript types.
+2. **Zero-height container:** The map container used `className="h-full w-full"` which resolved to 0px height because `flex-1` on the parent doesn't set a concrete pixel height at MapLibre's synchronous initialization time. Fixed by using `style={{ position: "absolute", inset: 0 }}` so the container inherits its positioned parent's dimensions.
+- Also stored the dynamically-imported MapLibre module in a ref so other effects (data updates, fitBounds) can use `LngLatBounds` without `require()`.
+- Files touched: src/components/map/map-view.tsx

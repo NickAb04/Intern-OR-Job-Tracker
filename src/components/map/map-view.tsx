@@ -1,23 +1,21 @@
 "use client";
 
-import { useRef, useEffect, useCallback } from "react";
-import {
-  Map,
-  NavigationControl,
-  Popup,
-  LngLatBounds,
-  type GeoJSONSource,
-  type ExpressionSpecification,
-} from "maplibre-gl";
-import "maplibre-gl/dist/maplibre-gl.css";
+import { useRef, useEffect, useCallback, useState } from "react";
 import { useTheme } from "next-themes";
 import { useUIStore } from "@/lib/stores/ui-store";
 import { MAP_DEFAULTS, STATUS_CONFIG } from "@/lib/constants";
 import type { Application, ApplicationStatus } from "@/lib/types";
 
+// Lazy-import MapLibre types for use in refs (actual import is dynamic)
+import type {
+  Map as MapType,
+  GeoJSONSource as GeoJSONSourceType,
+  ExpressionSpecification,
+} from "maplibre-gl";
+
 interface MapViewProps {
   applications: Application[];
-  onMapReady?: (map: Map) => void;
+  onMapReady?: (map: MapType) => void;
 }
 
 // Build a match expression for pin colors based on status
@@ -33,8 +31,9 @@ function buildColorExpression(): ExpressionSpecification {
 
 export function MapView({ applications, onMapReady }: MapViewProps) {
   const mapContainerRef = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<Map | null>(null);
-  const popupRef = useRef<Popup | null>(null);
+  const mapRef = useRef<MapType | null>(null);
+  const maplibreRef = useRef<typeof import("maplibre-gl") | null>(null);
+  const [mapLoaded, setMapLoaded] = useState(false);
   const { resolvedTheme } = useTheme();
 
   const {
@@ -76,202 +75,224 @@ export function MapView({ applications, onMapReady }: MapViewProps) {
     []
   );
 
-  // Initialize map
+  // Initialize map — dynamic import to avoid SSR window access
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
 
-    const style =
-      resolvedTheme === "dark"
-        ? MAP_DEFAULTS.styles.dark
-        : MAP_DEFAULTS.styles.light;
+    let cancelled = false;
 
-    const map = new Map({
-      container: mapContainerRef.current,
-      style,
-      center: [MAP_DEFAULTS.center.lng, MAP_DEFAULTS.center.lat],
-      zoom: MAP_DEFAULTS.zoom,
-    });
+    async function initMap() {
+      // Dynamic import — prevents SSR crash from window/document access
+      const maplibregl = await import("maplibre-gl");
+      await import("maplibre-gl/dist/maplibre-gl.css");
 
-    map.addControl(new NavigationControl(), "bottom-right");
+      if (cancelled || !mapContainerRef.current || mapRef.current) return;
 
-    map.on("load", () => {
-      // Add source with clustering
-      map.addSource("applications", {
-        type: "geojson",
-        data: toGeoJSON(applications),
-        cluster: true,
-        clusterRadius: MAP_DEFAULTS.cluster.radius,
-        clusterMaxZoom: MAP_DEFAULTS.cluster.maxZoom,
+      maplibreRef.current = maplibregl;
+
+      const style =
+        resolvedTheme === "dark"
+          ? MAP_DEFAULTS.styles.dark
+          : MAP_DEFAULTS.styles.light;
+
+      const map = new maplibregl.Map({
+        container: mapContainerRef.current,
+        style,
+        center: [MAP_DEFAULTS.center.lng, MAP_DEFAULTS.center.lat],
+        zoom: MAP_DEFAULTS.zoom,
       });
 
-      // Cluster circles
-      map.addLayer({
-        id: "clusters",
-        type: "circle",
-        source: "applications",
-        filter: ["has", "point_count"],
-        paint: {
-          "circle-color": [
-            "step",
-            ["get", "point_count"],
-            MAP_DEFAULTS.cluster.colors[0].color,
-            MAP_DEFAULTS.cluster.colors[1].count,
-            MAP_DEFAULTS.cluster.colors[1].color,
-            MAP_DEFAULTS.cluster.colors[2].count,
-            MAP_DEFAULTS.cluster.colors[2].color,
-          ],
-          "circle-radius": [
-            "step",
-            ["get", "point_count"],
-            MAP_DEFAULTS.cluster.colors[0].radius,
-            MAP_DEFAULTS.cluster.colors[1].count,
-            MAP_DEFAULTS.cluster.colors[1].radius,
-            MAP_DEFAULTS.cluster.colors[2].count,
-            MAP_DEFAULTS.cluster.colors[2].radius,
-          ],
-          "circle-stroke-width": 2,
-          "circle-stroke-color": "#ffffff",
-          "circle-opacity": 0.85,
-        },
-      });
+      map.addControl(new maplibregl.NavigationControl(), "bottom-right");
 
-      // Cluster count label
-      map.addLayer({
-        id: "cluster-count",
-        type: "symbol",
-        source: "applications",
-        filter: ["has", "point_count"],
-        layout: {
-          "text-field": "{point_count_abbreviated}",
-          "text-size": 13,
-          "text-font": ["Noto Sans Regular"],
-        },
-        paint: {
-          "text-color": "#ffffff",
-        },
-      });
+      map.on("load", () => {
+        if (cancelled) return;
 
-      // Individual pins
-      map.addLayer({
-        id: "unclustered-point",
-        type: "circle",
-        source: "applications",
-        filter: ["!", ["has", "point_count"]],
-        paint: {
-          "circle-color": buildColorExpression(),
-          "circle-radius": 8,
-          "circle-stroke-width": 2.5,
-          "circle-stroke-color": "#ffffff",
-        },
-      });
+        setMapLoaded(true);
 
-      // Click on cluster → zoom in
-      map.on("click", "clusters", async (e) => {
-        const features = map.queryRenderedFeatures(e.point, {
-          layers: ["clusters"],
+        // Add source with clustering
+        map.addSource("applications", {
+          type: "geojson",
+          data: toGeoJSON(applications),
+          cluster: true,
+          clusterRadius: MAP_DEFAULTS.cluster.radius,
+          clusterMaxZoom: MAP_DEFAULTS.cluster.maxZoom,
         });
-        if (!features.length) return;
-        const clusterId = features[0].properties?.cluster_id;
-        const source = map.getSource("applications");
-        if (source && "getClusterExpansionZoom" in source) {
-          const zoom = await (
-            source as GeoJSONSource
-          ).getClusterExpansionZoom(clusterId);
-          map.easeTo({
-            center: (features[0].geometry as GeoJSON.Point).coordinates as [
-              number,
-              number,
+
+        // Cluster circles
+        map.addLayer({
+          id: "clusters",
+          type: "circle",
+          source: "applications",
+          filter: ["has", "point_count"],
+          paint: {
+            "circle-color": [
+              "step",
+              ["get", "point_count"],
+              MAP_DEFAULTS.cluster.colors[0].color,
+              MAP_DEFAULTS.cluster.colors[1].count,
+              MAP_DEFAULTS.cluster.colors[1].color,
+              MAP_DEFAULTS.cluster.colors[2].count,
+              MAP_DEFAULTS.cluster.colors[2].color,
             ],
-            zoom,
+            "circle-radius": [
+              "step",
+              ["get", "point_count"],
+              MAP_DEFAULTS.cluster.colors[0].radius,
+              MAP_DEFAULTS.cluster.colors[1].count,
+              MAP_DEFAULTS.cluster.colors[1].radius,
+              MAP_DEFAULTS.cluster.colors[2].count,
+              MAP_DEFAULTS.cluster.colors[2].radius,
+            ],
+            "circle-stroke-width": 2,
+            "circle-stroke-color": "#ffffff",
+            "circle-opacity": 0.85,
+          },
+        });
+
+        // Cluster count label
+        map.addLayer({
+          id: "cluster-count",
+          type: "symbol",
+          source: "applications",
+          filter: ["has", "point_count"],
+          layout: {
+            "text-field": "{point_count_abbreviated}",
+            "text-size": 13,
+            "text-font": ["Noto Sans Regular"],
+          },
+          paint: {
+            "text-color": "#ffffff",
+          },
+        });
+
+        // Individual pins
+        map.addLayer({
+          id: "unclustered-point",
+          type: "circle",
+          source: "applications",
+          filter: ["!", ["has", "point_count"]],
+          paint: {
+            "circle-color": buildColorExpression(),
+            "circle-radius": 8,
+            "circle-stroke-width": 2.5,
+            "circle-stroke-color": "#ffffff",
+          },
+        });
+
+        // Click on cluster → zoom in
+        map.on("click", "clusters", async (e) => {
+          const features = map.queryRenderedFeatures(e.point, {
+            layers: ["clusters"],
           });
-        }
-      });
-
-      // Click on pin → open sidebar
-      map.on("click", "unclustered-point", (e) => {
-        if (isAddingPinRef.current) return; // Don't open sidebar in add mode
-        const features = map.queryRenderedFeatures(e.point, {
-          layers: ["unclustered-point"],
+          if (!features.length) return;
+          const clusterId = features[0].properties?.cluster_id;
+          const source = map.getSource("applications");
+          if (source && "getClusterExpansionZoom" in source) {
+            const zoom = await (
+              source as GeoJSONSourceType
+            ).getClusterExpansionZoom(clusterId);
+            map.easeTo({
+              center: (features[0].geometry as GeoJSON.Point).coordinates as [
+                number,
+                number,
+              ],
+              zoom,
+            });
+          }
         });
-        if (!features.length) return;
-        const appId = features[0].properties?.id;
-        if (appId) openSidebar(appId);
-      });
 
-      // Hover effects
-      map.on("mouseenter", "unclustered-point", () => {
-        map.getCanvas().style.cursor = "pointer";
-      });
-      map.on("mouseleave", "unclustered-point", () => {
-        map.getCanvas().style.cursor = isAddingPinRef.current
-          ? "crosshair"
-          : "";
-      });
-      map.on("mouseenter", "clusters", () => {
-        map.getCanvas().style.cursor = "pointer";
-      });
-      map.on("mouseleave", "clusters", () => {
-        map.getCanvas().style.cursor = isAddingPinRef.current
-          ? "crosshair"
-          : "";
-      });
-
-      // Hover popup on individual pins
-      map.on("mouseenter", "unclustered-point", (e) => {
-        const features = map.queryRenderedFeatures(e.point, {
-          layers: ["unclustered-point"],
+        // Click on pin → open sidebar
+        map.on("click", "unclustered-point", (e) => {
+          if (isAddingPinRef.current) return;
+          const features = map.queryRenderedFeatures(e.point, {
+            layers: ["unclustered-point"],
+          });
+          if (!features.length) return;
+          const appId = features[0].properties?.id;
+          if (appId) openSidebar(appId);
         });
-        if (!features.length) return;
-        const props = features[0].properties;
-        const coords = (features[0].geometry as GeoJSON.Point).coordinates;
 
-        if (popupRef.current) popupRef.current.remove();
-        popupRef.current = new Popup({
-          closeButton: false,
-          closeOnClick: false,
-          offset: 12,
-          className: "pin-popup",
-        })
-          .setLngLat(coords as [number, number])
-          .setHTML(
-            `<div style="font-family:var(--font-sans);font-size:13px;line-height:1.4;">
-              <strong>${props?.company_name}</strong><br/>
-              <span style="color:#6b7280">${props?.job_role}</span>
-            </div>`
-          )
-          .addTo(map);
-      });
-
-      map.on("mouseleave", "unclustered-point", () => {
-        if (popupRef.current) {
-          popupRef.current.remove();
-          popupRef.current = null;
-        }
-      });
-
-      // Click on empty map → add pin (if in add mode)
-      map.on("click", (e) => {
-        if (!isAddingPinRef.current) return;
-        // Check if click was on a feature
-        const features = map.queryRenderedFeatures(e.point, {
-          layers: ["unclustered-point", "clusters"],
+        // Hover effects
+        map.on("mouseenter", "unclustered-point", () => {
+          map.getCanvas().style.cursor = "pointer";
         });
-        if (features.length > 0) return;
+        map.on("mouseleave", "unclustered-point", () => {
+          map.getCanvas().style.cursor = isAddingPinRef.current
+            ? "crosshair"
+            : "";
+        });
+        map.on("mouseenter", "clusters", () => {
+          map.getCanvas().style.cursor = "pointer";
+        });
+        map.on("mouseleave", "clusters", () => {
+          map.getCanvas().style.cursor = isAddingPinRef.current
+            ? "crosshair"
+            : "";
+        });
 
-        setPendingPin({ latitude: e.lngLat.lat, longitude: e.lngLat.lng });
-        setCreateDialogOpen(true);
-        setIsAddingPin(false);
+        // Hover popup on individual pins
+        let popup: InstanceType<typeof maplibregl.Popup> | null = null;
+
+        map.on("mouseenter", "unclustered-point", (e) => {
+          const features = map.queryRenderedFeatures(e.point, {
+            layers: ["unclustered-point"],
+          });
+          if (!features.length) return;
+          const props = features[0].properties;
+          const coords = (features[0].geometry as GeoJSON.Point).coordinates;
+
+          if (popup) popup.remove();
+          popup = new maplibregl.Popup({
+            closeButton: false,
+            closeOnClick: false,
+            offset: 12,
+            className: "pin-popup",
+          })
+            .setLngLat(coords as [number, number])
+            .setHTML(
+              `<div style="font-family:var(--font-sans);font-size:13px;line-height:1.4;">
+                <strong>${props?.company_name}</strong><br/>
+                <span style="color:#6b7280">${props?.job_role}</span>
+              </div>`
+            )
+            .addTo(map);
+        });
+
+        map.on("mouseleave", "unclustered-point", () => {
+          if (popup) {
+            popup.remove();
+            popup = null;
+          }
+        });
+
+        // Click on empty map → add pin (if in add mode)
+        map.on("click", (e) => {
+          if (!isAddingPinRef.current) return;
+          const features = map.queryRenderedFeatures(e.point, {
+            layers: ["unclustered-point", "clusters"],
+          });
+          if (features.length > 0) return;
+
+          setPendingPin({ latitude: e.lngLat.lat, longitude: e.lngLat.lng });
+          setCreateDialogOpen(true);
+          setIsAddingPin(false);
+        });
+
+        // Notify parent
+        onMapReady?.(map);
       });
-    });
 
-    // Notify parent the map is ready
-    map.once("load", () => onMapReady?.(map));
+      mapRef.current = map;
+    }
 
-    mapRef.current = map;
+    initMap();
 
     return () => {
-      map.remove();
-      mapRef.current = null;
+      cancelled = true;
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -279,14 +300,13 @@ export function MapView({ applications, onMapReady }: MapViewProps) {
   // Update map style when theme changes
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.loaded()) return;
+    if (!map || !mapLoaded) return;
 
     const newStyle =
       resolvedTheme === "dark"
         ? MAP_DEFAULTS.styles.dark
         : MAP_DEFAULTS.styles.light;
 
-    // Save current view state
     const center = map.getCenter();
     const zoom = map.getZoom();
 
@@ -365,22 +385,22 @@ export function MapView({ applications, onMapReady }: MapViewProps) {
         });
       }
     });
-  }, [resolvedTheme, applications, toGeoJSON]);
+  }, [resolvedTheme, applications, toGeoJSON, mapLoaded]);
 
   // Update GeoJSON data when applications change
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.loaded()) return;
+    const ml = maplibreRef.current;
+    if (!map || !mapLoaded || !ml) return;
 
-    const source = map.getSource("applications") as GeoJSONSource;
+    const source = map.getSource("applications") as GeoJSONSourceType | undefined;
     if (source) {
       source.setData(toGeoJSON(applications));
     }
 
-    // Fit bounds to pins if there are any
     const nonArchived = applications.filter((a) => !a.archived);
     if (nonArchived.length > 0) {
-      const bounds = new LngLatBounds();
+      const bounds = new ml.LngLatBounds();
       nonArchived.forEach((app) => {
         bounds.extend([app.longitude, app.latitude]);
       });
@@ -388,7 +408,7 @@ export function MapView({ applications, onMapReady }: MapViewProps) {
         map.fitBounds(bounds, { padding: 80, maxZoom: 14, duration: 500 });
       }
     }
-  }, [applications, toGeoJSON]);
+  }, [applications, toGeoJSON, mapLoaded]);
 
   // Update cursor when add-pin mode changes
   useEffect(() => {
@@ -401,7 +421,7 @@ export function MapView({ applications, onMapReady }: MapViewProps) {
     <div
       ref={mapContainerRef}
       id="map-container"
-      className="h-full w-full"
+      style={{ position: "absolute", inset: 0 }}
     />
   );
 }

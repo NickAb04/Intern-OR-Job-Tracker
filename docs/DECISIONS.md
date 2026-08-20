@@ -54,3 +54,10 @@ Also requires `@types/geojson` for `GeoJSON.FeatureCollection` type.
 ## 2026-08-14 — OpenFreeMap: positron (light) + dark styles, no API key
 Free vector tiles from openfreemap.org. Styles switch with theme via `map.setStyle()`.
 Source/layers must be re-added after `style.load` since setStyle destroys them.
+
+## 2026-08-21 — MapLibre must be dynamically imported in Next.js
+MapLibre GL JS accesses `window`/`document` at import time. Even with `"use client"`,
+Next.js SSR-renders the component before hydration. Use `await import("maplibre-gl")`
+inside `useEffect`; only `import type` is safe at the top level.
+The map container also needs `position: absolute; inset: 0` (not `h-full`) for a
+guaranteed pixel height at MapLibre's synchronous initialization time.
